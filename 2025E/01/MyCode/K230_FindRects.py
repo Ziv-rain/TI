@@ -68,6 +68,35 @@ def send_error_k210(uart, err_x, err_y):
     uart.write(data)
 
 
+def calculate_perspective_center(corners):
+    """
+    通过矩形两条对角线交点计算透视中心点。
+
+    参数:
+        corners: 矩形四个角点，格式为[(x1, y1), (x2, y2), (x3, y3), (x4, y4)]
+
+    返回值:
+        (center_x, center_y)。当角点数量异常时返回(None, None)。
+    """
+    if corners is None or len(corners) < 4:
+        return None, None
+
+    x1, y1 = corners[0]
+    x3, y3 = corners[2]
+    x2, y2 = corners[1]
+    x4, y4 = corners[3]
+
+    # 两条对角线近乎平行时，退化为四角平均，避免除零。
+    denom = (x1 - x3) * (y2 - y4) - (y1 - y3) * (x2 - x4)
+    if abs(denom) < 1e-6:
+        return sum(p[0] for p in corners) // 4, sum(p[1] for p in corners) // 4
+
+    px = ((x1 * y3 - y1 * x3) * (x2 - x4) - (x1 - x3) * (x2 * y4 - y2 * x4)) / denom
+    py = ((x1 * y3 - y1 * x3) * (y2 - y4) - (y1 - y3) * (x2 * y4 - y2 * x4)) / denom
+
+    return int(px), int(py)
+
+
 sensor = Sensor(width=1280, height=960)  #构建摄像头对象
 sensor.reset()  #复位和初始化摄像头
 
@@ -159,14 +188,14 @@ try:
             if valid_rects:
                 max_rect = max(valid_rects, key=lambda r: r.w() * r.h())
                 corners = max_rect.corners()
-                target_cx = sum([p[0] for p in corners]) // 4
-                target_cy = sum([p[1] for p in corners]) // 4
+                target_cx, target_cy = calculate_perspective_center(corners)
 
                 # 可视化检测结果
                 img.draw_rectangle(max_rect.rect(), color=(0, 255, 0), thickness=2)
                 for pt in corners:
                     img.draw_circle(pt[0], pt[1], 2, color=(0, 0, 255), fill=True)
-                img.draw_cross(target_cx, target_cy, color=(255, 255, 0), size=5)
+                if target_cx is not None:
+                    img.draw_cross(target_cx, target_cy, color=(255, 255, 0), size=5)
 
         final_err_x = 0
         final_err_y = 0
