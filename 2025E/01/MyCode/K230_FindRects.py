@@ -7,7 +7,6 @@
 
 import time
 import gc
-import image
 
 from media.sensor import *  #导入sensor模块，使用摄像头相关接口
 from media.display import *  #导入display模块，使用display相关接口
@@ -25,15 +24,6 @@ fpioa.set_function(3, FPIOA.UART1_TXD)
 fpioa.set_function(4, FPIOA.UART1_RXD)
 
 uart = UART(UART.UART1, 115200)  #设置串口号1和波特率115200
-
-DISPLAY_WIDTH = 800
-DISPLAY_HEIGHT = 480
-
-# OSD信息显示区域（放在黑框上方，避免覆盖摄像头画面）
-OSD_TEXT_X = 8
-OSD_TEXT_Y = 8
-OSD_TEXT_W = 520
-OSD_TEXT_H = 32
 
 # 屏幕中心点
 # 默认先按方案A全画幅中心，若窗口裁剪成功再切换为K210中心点
@@ -60,11 +50,15 @@ last_target_cx = None
 last_target_cy = None
 reuse_counter = 0
 
-# OSD叠加层运行时状态
-use_osd_layer = False
-osd_img = None
-osd_layer = None
-osd_show_mode = None
+# 日志节流参数（减少串口输出对帧率的影响）
+LOG_INTERVAL_FRAMES = 20
+last_runtime_log_state = "INIT"
+
+# 内存阈值回收参数（优先按阈值触发，缺少接口时退化为低频回收）
+GC_CHECK_INTERVAL_FRAMES = 10
+GC_FREE_MEM_THRESHOLD = 180 * 1024
+GC_FALLBACK_INTERVAL_FRAMES = 150
+last_gc_frame = 0
 
 
 def send_error_k210(uart, err_x, err_y):
@@ -126,27 +120,6 @@ def calculate_perspective_center(corners):
     return int(px), int(py)
 
 
-def show_image_on_layer(img_obj, x, y, layer):
-    """
-    兼容不同固件的Display.show_image(layer=...)调用方式。
-    """
-    global osd_show_mode
-
-    if osd_show_mode == "kw":
-        Display.show_image(img_obj, x=x, y=y, layer=layer)
-        return
-    if osd_show_mode == "pos":
-        Display.show_image(img_obj, x, y, layer)
-        return
-
-    try:
-        Display.show_image(img_obj, x=x, y=y, layer=layer)
-        osd_show_mode = "kw"
-    except TypeError:
-        Display.show_image(img_obj, x, y, layer)
-        osd_show_mode = "pos"
-
-
 sensor = Sensor(width=1280, height=960)  #构建摄像头对象
 sensor.reset()  #复位和初始化摄像头
 
@@ -188,27 +161,11 @@ if hasattr(sensor, "set_hmirror"):
 # if hasattr(sensor, "set_auto_exposure"):
 #     sensor.set_auto_exposure(False)
 
-Display.init(Display.ST7701, to_ide=True)  #同时使用3.5寸mipi屏和IDE缓冲区显示图像，800x480分辨率
-#Display.init(Display.VIRT, sensor.width(), sensor.height()) #只使用IDE缓冲区显示图像
+Display.init(Display.ST7701, to_ide=False)  #仅使用3.5寸mipi屏显示图像
 
 MediaManager.init()  #初始化media资源管理器
 
 sensor.run()  #启动sensor
-
-# 仅在支持OSD图层的固件上启用黑框叠加文字显示。
-if hasattr(Display, "LAYER_OSD0") and hasattr(Display, "show_image"):
-    try:
-        osd_layer = Display.LAYER_OSD0
-        osd_format = image.ARGB8888 if hasattr(image, "ARGB8888") else image.RGB565
-        osd_img = image.Image(OSD_TEXT_W, OSD_TEXT_H, osd_format)
-        use_osd_layer = True
-        print("OSD叠加层已启用，信息将显示在黑框区域")
-    except Exception as e:
-        use_osd_layer = False
-        osd_img = None
-        print("OSD叠加层初始化失败，自动回退到图像内绘制:", e)
-else:
-    print("当前固件未提供OSD图层接口，使用图像内绘制")
 
 clock = time.clock()
 
@@ -216,21 +173,38 @@ try:
     while True:
         clock.tick()
 
-        # 周期性垃圾回收，降低长时间运行时的内存碎片风险
+        # 按空闲内存阈值触发垃圾回收，避免固定周期导致卡顿。
         frame_count += 1
-        if frame_count % 30 == 0:
-            gc.collect()
+        if frame_count % GC_CHECK_INTERVAL_FRAMES == 0:
+            need_gc = False
+            if hasattr(gc, "mem_free"):
+                try:
+                    free_mem = gc.mem_free()
+                    if free_mem < GC_FREE_MEM_THRESHOLD:
+                        need_gc = True
+                except Exception:
+                    # mem_free接口异常时回退到低频回收。
+                    if frame_count % GC_FALLBACK_INTERVAL_FRAMES == 0:
+                        need_gc = True
+            elif frame_count % GC_FALLBACK_INTERVAL_FRAMES == 0:
+                need_gc = True
+
+            if need_gc and (frame_count - last_gc_frame >= GC_CHECK_INTERVAL_FRAMES):
+                gc.collect()
+                last_gc_frame = frame_count
 
         # 显式处理拍照异常与空帧，确保下位机始终收到有效协议帧
         try:
             img = sensor.snapshot()
         except Exception as e:
-            print("拍照异常，发送误差 -> ErrX: 0, ErrY: 0", e)
+            if frame_count % LOG_INTERVAL_FRAMES == 0:
+                print("拍照异常，发送误差 -> ErrX: 0, ErrY: 0", e)
             send_error_k210(uart, 0, 0)
             continue
 
         if img is None:
-            print("收到空帧，发送误差 -> ErrX: 0, ErrY: 0")
+            if frame_count % LOG_INTERVAL_FRAMES == 0:
+                print("收到空帧，发送误差 -> ErrX: 0, ErrY: 0")
             send_error_k210(uart, 0, 0)
             continue
 
@@ -257,8 +231,6 @@ try:
 
                 # 可视化检测结果
                 img.draw_rectangle(max_rect.rect(), color=(0, 255, 0), thickness=2)
-                for pt in corners:
-                    img.draw_circle(pt[0], pt[1], 2, color=(0, 0, 255), fill=True)
                 if target_cx is not None:
                     img.draw_cross(target_cx, target_cy, color=(255, 255, 0), size=5)
 
@@ -302,57 +274,58 @@ try:
         final_err_x = 0
         final_err_y = 0
 
+        runtime_state = "LOST"
+        runtime_log_msg = ""
+
         if tracking_locked and target_cx is not None:
             final_err_x = target_cx - SCREEN_CENTER_X
             final_err_y = target_cy - SCREEN_CENTER_Y
             if used_fallback:
-                print("目标短时丢失，沿用上一帧 -> ErrX: %d, ErrY: %d" % (final_err_x, final_err_y))
+                runtime_state = "LOCK_FALLBACK"
+                runtime_log_msg = "目标短时丢失，沿用上一帧 -> ErrX: %d, ErrY: %d" % (final_err_x, final_err_y)
             else:
-                print("锁定靶纸！发送误差 -> ErrX: %d, ErrY: %d" % (final_err_x, final_err_y))
+                runtime_state = "LOCK"
+                runtime_log_msg = "锁定靶纸！发送误差 -> ErrX: %d, ErrY: %d" % (final_err_x, final_err_y)
         elif current_detected:
-            print("检测到候选目标，稳定中(%d/%d)，发送误差 -> ErrX: 0, ErrY: 0" % (detect_counter, MIN_DETECT_FRAMES))
+            runtime_state = "CANDIDATE"
+            runtime_log_msg = "检测到候选目标，稳定中(%d/%d)，发送误差 -> ErrX: 0, ErrY: 0" % (detect_counter, MIN_DETECT_FRAMES)
         else:
-            print("未检测到靶纸，发送误差 -> ErrX: 0, ErrY: 0")
+            runtime_state = "LOST"
+            runtime_log_msg = "未检测到靶纸，发送误差 -> ErrX: 0, ErrY: 0"
+
+        if runtime_state != last_runtime_log_state or (frame_count % LOG_INTERVAL_FRAMES == 0):
+            print(runtime_log_msg)
+            last_runtime_log_state = runtime_state
 
         # 串口发送K210兼容误差帧
         send_error_k210(uart, final_err_x, final_err_y)
 
-        # 显示机械准心
+        # 显示机械准心与状态信息（大字号双行）
         img.draw_cross(SCREEN_CENTER_X, SCREEN_CENTER_Y, color=(255, 0, 0), size=6)
-
         fps_now = clock.fps()
         status_str = "LOCK" if tracking_locked else "SEARCH"
-        info_str = "FPS:%.1f ErrX:%d ErrY:%d %s" % (fps_now, final_err_x, final_err_y, status_str)
+        line_1 = "FPS %.1f %s" % (fps_now, status_str)
+        line_2 = "EX %d  EY %d" % (final_err_x, final_err_y)
 
-        if use_osd_layer and osd_img is not None and osd_layer is not None:
-            try:
-                if hasattr(osd_img, "draw_rectangle"):
-                    osd_img.draw_rectangle(0, 0, OSD_TEXT_W, OSD_TEXT_H, color=(0, 0, 0), fill=True)
+        # 顶部黑底条，避免白字叠在复杂背景上看不清。
+        if hasattr(img, "draw_rectangle"):
+            overlay_h = 44 if img.height() >= 120 else 28
+            img.draw_rectangle(0, 0, img.width(), overlay_h, color=(0, 0, 0), fill=True)
 
-                if hasattr(osd_img, "draw_string_advanced"):
-                    if hasattr(image, "ARGB8888"):
-                        osd_img.draw_string_advanced(4, 3, 24, info_str, color=(255, 255, 255, 255))
-                    else:
-                        osd_img.draw_string_advanced(4, 3, 24, info_str, color=(255, 255, 255))
-                elif hasattr(osd_img, "draw_string"):
-                    osd_img.draw_string(2, 2, info_str, color=(255, 255, 255), scale=1)
-
-                show_image_on_layer(osd_img, OSD_TEXT_X, OSD_TEXT_Y, osd_layer)
-            except Exception as e:
-                # 运行中若OSD异常，自动降级为图像内绘制避免主流程中断。
-                use_osd_layer = False
-                print("OSD叠加绘制失败，自动回退到图像内绘制:", e)
-
-        if (not use_osd_layer) and hasattr(img, "draw_string"):
-            img.draw_string(2, 2, info_str, color=(255, 255, 255), scale=1)
+        if hasattr(img, "draw_string_advanced"):
+            img.draw_string_advanced(2, 2, 20, line_1, color=(255, 255, 255))
+            img.draw_string_advanced(2, 22, 20, line_2, color=(255, 255, 255))
+        elif hasattr(img, "draw_string"):
+            img.draw_string(2, 2, line_1, color=(255, 255, 255), scale=2)
+            img.draw_string(2, 20, line_2, color=(255, 255, 255), scale=2)
 
         # 保持当前K230显示链路，按图像尺寸居中显示
         show_w = img.width() if hasattr(img, "width") else sensor.width()
         show_h = img.height() if hasattr(img, "height") else sensor.height()
         Display.show_image(
             img,
-            x=round((DISPLAY_WIDTH - show_w) / 2),
-            y=round((DISPLAY_HEIGHT - show_h) / 2),
+            x=round((800 - show_w) / 2),
+            y=round((480 - show_h) / 2),
         )
 except KeyboardInterrupt:
     print("用户中断程序，准备释放资源")
