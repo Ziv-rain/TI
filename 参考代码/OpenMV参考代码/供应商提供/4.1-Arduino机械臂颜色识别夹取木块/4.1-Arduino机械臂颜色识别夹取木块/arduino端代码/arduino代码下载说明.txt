@@ -1,0 +1,1 @@
+打开Arduloader.exe，选择arduino_demo.hex，然后点击upload等待上传成功即可。

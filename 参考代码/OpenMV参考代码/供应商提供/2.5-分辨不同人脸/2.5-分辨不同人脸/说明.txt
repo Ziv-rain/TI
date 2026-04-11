@@ -1,0 +1,2 @@
+face_collection.py 是采集人脸
+face_recognition.py 是分辨不同人脸（注意要先根据教程采集人脸，然后再来分辨人脸）

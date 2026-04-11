@@ -1,0 +1,1 @@
+先将pid.py文件保存到openmv的盘符中，然后用openmv ide打开face_tracking.py运行使用即可

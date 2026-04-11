@@ -1,0 +1,1 @@
+将 labels.txt 和 trained.tflite 保存到openmv的盘符中，然后在openmv ide中打开num_detection.py运行使用即可

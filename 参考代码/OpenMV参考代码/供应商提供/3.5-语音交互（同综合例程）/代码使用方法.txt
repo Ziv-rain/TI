@@ -1,0 +1,1 @@
+将AI_Functions、models、ZL_SDK文件夹都保存到openmv的盘符中，然后在openmv ide中将z_main.py文件存到openmv中，脱机运行即可

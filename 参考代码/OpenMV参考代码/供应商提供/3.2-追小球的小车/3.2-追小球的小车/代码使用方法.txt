@@ -1,0 +1,1 @@
+将ZL_SDK文件夹保存到openmv的盘符中，然后在openmv ide中把car_follow_color.py保存到openmv中脱机运行使用即可，注意运行之前调整颜色阈值
