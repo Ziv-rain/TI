@@ -37,6 +37,19 @@ frame_count = 0
 MIN_RECT_SIDE = 50
 MAX_RECT_AREA_RATIO = 0.45
 
+# 检测状态滤波参数
+MIN_DETECT_FRAMES = 2
+MIN_LOST_FRAMES = 5
+MAX_REUSE_FRAMES = 3
+
+# 运行时状态
+detect_counter = 0
+lost_counter = 0
+tracking_locked = False
+last_target_cx = None
+last_target_cy = None
+reuse_counter = 0
+
 
 def send_error_k210(uart, err_x, err_y):
     """
@@ -197,13 +210,55 @@ try:
                 if target_cx is not None:
                     img.draw_cross(target_cx, target_cy, color=(255, 255, 0), size=5)
 
+        current_detected = (target_cx is not None) and (target_cy is not None)
+        used_fallback = False
+
+        # 上一帧回退：短时丢失时沿用最近一次有效中心，降低瞬时跳变。
+        if current_detected:
+            last_target_cx = target_cx
+            last_target_cy = target_cy
+            reuse_counter = 0
+        elif last_target_cx is not None and reuse_counter < MAX_REUSE_FRAMES:
+            target_cx = last_target_cx
+            target_cy = last_target_cy
+            used_fallback = True
+            reuse_counter += 1
+
+        # 连续检测/丢失滤波：避免单帧误检导致状态抖动。
+        if current_detected:
+            lost_counter = 0
+            if not tracking_locked:
+                detect_counter += 1
+                if detect_counter >= MIN_DETECT_FRAMES:
+                    tracking_locked = True
+                    detect_counter = 0
+            else:
+                detect_counter = 0
+        else:
+            detect_counter = 0
+            if tracking_locked:
+                lost_counter += 1
+                if lost_counter >= MIN_LOST_FRAMES:
+                    tracking_locked = False
+                    lost_counter = 0
+                    reuse_counter = 0
+                    last_target_cx = None
+                    last_target_cy = None
+            else:
+                lost_counter = 0
+
         final_err_x = 0
         final_err_y = 0
 
-        if target_cx is not None:
+        if tracking_locked and target_cx is not None:
             final_err_x = target_cx - SCREEN_CENTER_X
             final_err_y = target_cy - SCREEN_CENTER_Y
-            print("锁定靶纸！发送误差 -> ErrX: %d, ErrY: %d" % (final_err_x, final_err_y))
+            if used_fallback:
+                print("目标短时丢失，沿用上一帧 -> ErrX: %d, ErrY: %d" % (final_err_x, final_err_y))
+            else:
+                print("锁定靶纸！发送误差 -> ErrX: %d, ErrY: %d" % (final_err_x, final_err_y))
+        elif current_detected:
+            print("检测到候选目标，稳定中(%d/%d)，发送误差 -> ErrX: 0, ErrY: 0" % (detect_counter, MIN_DETECT_FRAMES))
         else:
             print("未检测到靶纸，发送误差 -> ErrX: 0, ErrY: 0")
 
@@ -212,7 +267,8 @@ try:
 
         # 显示机械准心与误差信息
         img.draw_cross(SCREEN_CENTER_X, SCREEN_CENTER_Y, color=(255, 0, 0), size=6)
-        info_str = "ErrX:%d ErrY:%d" % (final_err_x, final_err_y)
+        status_str = "LOCK" if tracking_locked else "SEARCH"
+        info_str = "ErrX:%d ErrY:%d %s" % (final_err_x, final_err_y, status_str)
         if hasattr(img, "draw_string"):
             img.draw_string(2, 2, info_str, color=(255, 255, 255), scale=1)
 
