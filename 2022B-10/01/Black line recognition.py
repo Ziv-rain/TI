@@ -15,9 +15,9 @@ MIN_ASPECT_RATIO = 1.2  # 竖线约束：h / w 需要足够大
 
 # 抗断裂预处理参数（针对黑线中间被高光切断）
 SMOOTH_MEAN_KSIZE = 1
-CLOSE_DILATE_ITER = 3
+CLOSE_DILATE_ITER = 2
 CLOSE_ERODE_ITER = 1
-BLOB_MERGE_MARGIN = 16
+BLOB_MERGE_MARGIN = 12
 
 ROI_TOP = 20  # 忽略上方远处区域，降低干扰
 UNLOCK_MISS_FRAMES = 3  # 丢失若干帧后，允许识别下一条线
