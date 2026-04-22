@@ -11,27 +11,51 @@ import time
 BLACK_THRESHOLD = (0, 55)
 
 # 候选区域最小像素和面积，过滤小噪声
-PIXELS_THRESHOLD = 120
-AREA_THRESHOLD = 120
+PIXELS_THRESHOLD = 200
+AREA_THRESHOLD = 200
 
 # 几何筛选：竖直矩形应“高明显大于宽”
 MIN_WIDTH = 6
 MIN_HEIGHT = 16
 MIN_ASPECT_RATIO = 1.8
-MIN_DENSITY = 0.45
+MIN_DENSITY = 0.8
 MIN_ELONGATION = 0.45
 
 # 竖直角度容差（度）：误差越小越严格
-VERTICAL_TOLERANCE_DEG = 3.0
+VERTICAL_TOLERANCE_DEG = 1.0
+
+# ROI分割：只关注下半屏（从画面高度的50%开始）
+ROI_Y_START_RATIO = 0.5
+SHOW_ROI_BOX = True
+DETECTION_ROI = None
+
+# 计数去重参数
+# 连续丢失这么多帧后，才允许下一次计数。
+COUNT_LOST_RESET_FRAMES = 10
+# 每次计数后进入冷却，避免同一目标短时抖动重复计数。
+COUNT_COOLDOWN_FRAMES = 8
+
+# 串口打印控制
+# True: 仅打印计数变化；False: 额外按间隔打印状态。
+PRINT_COUNT_ONLY = True
+STATUS_PRINT_INTERVAL = 20
 
 
 def init_camera():
     """初始化OpenMV相机参数。"""
+    global DETECTION_ROI
+
     sensor.reset()
     sensor.set_pixformat(sensor.GRAYSCALE)
     sensor.set_framesize(sensor.QQVGA)
     sensor.set_auto_gain(False)
     sensor.skip_frames(time=2000)
+
+    # 根据当前分辨率动态生成下半屏ROI。
+    width = sensor.width()
+    height = sensor.height()
+    roi_y = int(height * ROI_Y_START_RATIO)
+    DETECTION_ROI = (0, roi_y, width, height - roi_y)
 
 
 def calc_vertical_error_deg(blob):
@@ -86,13 +110,23 @@ def main_loop():
     clock = time.clock()
     frame_id = 0
 
+    # 计数与去重状态
+    target_count = 0
+    count_latch = False
+    lost_frames = 0
+    cooldown_frames = 0
+
     while True:
         clock.tick()
         img = sensor.snapshot()
         frame_id += 1
 
+        if SHOW_ROI_BOX:
+            img.draw_rectangle(DETECTION_ROI, color=180, thickness=1)
+
         blobs = img.find_blobs(
             [BLACK_THRESHOLD],
+            roi=DETECTION_ROI,
             pixels_threshold=PIXELS_THRESHOLD,
             area_threshold=AREA_THRESHOLD,
             merge=True,
@@ -116,29 +150,59 @@ def main_loop():
         valid_targets.sort(key=lambda item: item[0].pixels(), reverse=True)
         fps = clock.fps()
 
+        # 冷却帧递减。
+        if cooldown_frames > 0:
+            cooldown_frames -= 1
+
+        # 去重计数状态机。
         if valid_targets:
-            best_blob, best_ar, best_err, best_angle = valid_targets[0]
-            print(
-                "F=%d DET=1 CAND=%d OK=%d CX=%d CY=%d W=%d H=%d AR=%.2f ANG=%.2f ERR=%.2f FPS=%.2f"
-                % (
-                    frame_id,
-                    len(blobs),
-                    len(valid_targets),
-                    best_blob.cx(),
-                    best_blob.cy(),
-                    best_blob.w(),
-                    best_blob.h(),
-                    best_ar,
-                    best_angle,
-                    best_err,
-                    fps,
-                )
-            )
+            lost_frames = 0
+            if (not count_latch) and (cooldown_frames == 0):
+                target_count += 1
+                count_latch = True
+                cooldown_frames = COUNT_COOLDOWN_FRAMES
+                print("COUNT=%d" % target_count)
         else:
-            print("F=%d DET=0 CAND=%d OK=0 FPS=%.2f" % (frame_id, len(blobs), fps))
+            lost_frames += 1
+            if lost_frames >= COUNT_LOST_RESET_FRAMES:
+                count_latch = False
+
+        # 仅在需要时打印状态，避免刷屏影响观察计数。
+        if (not PRINT_COUNT_ONLY) and ((frame_id % STATUS_PRINT_INTERVAL) == 0):
+            if valid_targets:
+                best_blob, best_ar, best_err, best_angle = valid_targets[0]
+                print(
+                    "F=%d DET=1 CNT=%d LAT=%d LOST=%d CD=%d CX=%d CY=%d W=%d H=%d AR=%.2f ANG=%.2f ERR=%.2f FPS=%.2f"
+                    % (
+                        frame_id,
+                        target_count,
+                        int(count_latch),
+                        lost_frames,
+                        cooldown_frames,
+                        best_blob.cx(),
+                        best_blob.cy(),
+                        best_blob.w(),
+                        best_blob.h(),
+                        best_ar,
+                        best_angle,
+                        best_err,
+                        fps,
+                    )
+                )
+            else:
+                print(
+                    "F=%d DET=0 CNT=%d LAT=%d LOST=%d CD=%d FPS=%.2f"
+                    % (
+                        frame_id,
+                        target_count,
+                        int(count_latch),
+                        lost_frames,
+                        cooldown_frames,
+                        fps,
+                    )
+                )
 
 
 if __name__ == "__main__":
     init_camera()
     main_loop()
-
