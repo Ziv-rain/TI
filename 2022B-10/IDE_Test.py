@@ -2,6 +2,11 @@ import math
 import sensor
 import time
 
+try:
+    from pyb import UART
+except ImportError:
+    UART = None
+
 
 # =========================
 # 可调参数（先在现场标定这些参数）
@@ -40,6 +45,24 @@ COUNT_COOLDOWN_FRAMES = 8
 PRINT_COUNT_ONLY = True
 STATUS_PRINT_INTERVAL = 20
 
+# 串口协议配置（视觉端 -> 电控端）
+UART_PORT = 1
+UART_BAUDRATE = 115200
+FRAME_HEADER_1 = 0xAA
+FRAME_HEADER_2 = 0x55
+FRAME_LEN = 0x00
+
+# 命令字定义
+CMD_REVERSE_PARK = 0x01
+CMD_SIDE_PARK = 0x02
+
+# 指令触发阈值
+TRIGGER_COUNT_CMD01 = 3
+TRIGGER_COUNT_CMD02 = 6
+
+# 发送01后暂停识别时长（毫秒，可随时调整）
+PAUSE_AFTER_CMD01_MS = 3000
+
 
 def init_camera():
     """初始化OpenMV相机参数。"""
@@ -56,6 +79,28 @@ def init_camera():
     height = sensor.height()
     roi_y = int(height * ROI_Y_START_RATIO)
     DETECTION_ROI = (0, roi_y, width, height - roi_y)
+
+
+def init_uart():
+    """初始化UART3串口。"""
+    if UART is None:
+        print("UART_INIT_FAIL")
+        return None
+    return UART(UART_PORT, UART_BAUDRATE, bits=8, parity=None, stop=1)
+
+
+def build_uart_frame(cmd):
+    """构建固定5字节协议帧：AA 55 CMD 00 CHK。"""
+    checksum = (FRAME_HEADER_1 + FRAME_HEADER_2 + cmd + FRAME_LEN) & 0xFF
+    return bytes((FRAME_HEADER_1, FRAME_HEADER_2, cmd, FRAME_LEN, checksum))
+
+
+def send_uart_command(uart, cmd):
+    """发送协议帧并打印发送内容。"""
+    frame = build_uart_frame(cmd)
+    if uart is not None:
+        uart.write(frame)
+    print("TX=%02X %02X %02X %02X %02X" % (frame[0], frame[1], frame[2], frame[3], frame[4]))
 
 
 def calc_vertical_error_deg(blob):
@@ -109,12 +154,21 @@ def check_vertical_black_rect(blob):
 def main_loop():
     clock = time.clock()
     frame_id = 0
+    uart = init_uart()
 
     # 计数与去重状态
     target_count = 0
     count_latch = False
     lost_frames = 0
     cooldown_frames = 0
+
+    # 命令触发状态（确保每条命令只发送一次）
+    cmd01_sent = False
+    cmd02_sent = False
+
+    # 识别暂停状态（发送01后启用）
+    pause_until_ms = 0
+    is_paused = False
 
     while True:
         clock.tick()
@@ -123,6 +177,13 @@ def main_loop():
 
         if SHOW_ROI_BOX:
             img.draw_rectangle(DETECTION_ROI, color=180, thickness=1)
+
+        # 发送01后暂停识别，到时自动恢复。
+        if is_paused:
+            if time.ticks_diff(pause_until_ms, time.ticks_ms()) > 0:
+                continue
+            is_paused = False
+            print("RESUME")
 
         blobs = img.find_blobs(
             [BLACK_THRESHOLD],
@@ -166,6 +227,30 @@ def main_loop():
             lost_frames += 1
             if lost_frames >= COUNT_LOST_RESET_FRAMES:
                 count_latch = False
+
+        # 指令触发：target_count=3时发送01并暂停识别。
+        if (target_count == TRIGGER_COUNT_CMD01) and (not cmd01_sent):
+            send_uart_command(uart, CMD_REVERSE_PARK)
+            cmd01_sent = True
+
+            # 暂停期间重置去重状态，恢复后按新场景继续识别。
+            pause_until_ms = time.ticks_add(time.ticks_ms(), PAUSE_AFTER_CMD01_MS)
+            is_paused = True
+            count_latch = False
+            lost_frames = COUNT_LOST_RESET_FRAMES
+            cooldown_frames = 0
+            print("PAUSE=%dms" % PAUSE_AFTER_CMD01_MS)
+
+        # 指令触发：target_count=6时发送02。
+        if (target_count == TRIGGER_COUNT_CMD02) and (not cmd02_sent):
+            send_uart_command(uart, CMD_SIDE_PARK)
+            cmd02_sent = True
+
+            # 到6后清零计数，并重置触发标记进入下一轮。
+            target_count = 0
+            cmd01_sent = False
+            cmd02_sent = False
+            print("COUNT=0")
 
         # 仅在需要时打印状态，避免刷屏影响观察计数。
         if (not PRINT_COUNT_ONLY) and ((frame_id % STATUS_PRINT_INTERVAL) == 0):
